@@ -12,7 +12,7 @@ import cv2
 #Some parts of the code are inspired by Unity mlagents
 
 class Model():
-    def __init__(self,summaries_dir, obs_type):
+    def __init__(self,summaries_dir, obs_type, action_type):
         if summaries_dir:
             if not os.path.exists(summaries_dir):
                 os.makedirs(summaries_dir)
@@ -24,6 +24,7 @@ class Model():
         self.visual_observations = 4
         self.action = tf.placeholder(shape=[None],dtype=tf.int32, name="action")
         self.obs_type = obs_type
+        self.action_type= action_type
         if obs_type == 'visual': 
             encoded_state, encoded_next_state=self.VisualStateProcessor()
         else:
@@ -116,21 +117,40 @@ class Model():
             decay_epsilon = tf.train.polynomial_decay(0.2, tf.train.get_global_step(), self.max_steps, 0.1, power=1.0)
             self.advantage = tf.placeholder(shape=[None],dtype=tf.float32, name="advantage")
             self.old_action_probs = tf.placeholder(shape=[None, self.a_size],dtype=tf.float32)
-            self.action_probs = tf.layers.dense(encoded_state, self.a_size, activation=tf.nn.softmax,
-                                                kernel_initializer=tf.contrib.layers.variance_scaling_initializer(0.01))
+            if self.action_type == 'continuous':
+                mu = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
+                sigma = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
+                sigma = tf.nn.softplus(sigma) + 1e-5
+                norm_dist = tf.contrib.distributions.Normal(mu, sigma)
 
-            self.picked_action_prob=tf.reduce_sum(self.action_probs * tf.one_hot(self.action, self.a_size), axis=1)
-            self.picked_old_action_prob=tf.reduce_sum(self.old_action_probs * tf.one_hot(self.action, self.a_size),axis=1)
-            self.entropy=-tf.reduce_sum(self.action_probs * tf.log(self.action_probs + 1e-10))
-            self.mean_entropy = -tf.reduce_mean(self.action_probs * tf.log(self.action_probs + 1e-10))
-            #Policy gradient
-            #self.policy_loss =tf.reduce_mean( -tf.log(self.picked_action_prob+ 1e-10) * self.advantage)
-            #Clipped Surrogate Objective
-            ratio = self.picked_action_prob / (self.picked_old_action_prob  + 1e-10)
-            a = ratio * self.advantage
-            b = tf.clip_by_value(ratio, 1.0 - decay_epsilon, 1.0 + decay_epsilon) * self.advantage
-            self.policy_loss=-tf.reduce_mean(tf.minimum(a,b))
-            
+                #action_tf_var can be backpropagated
+                self.action_tf_var = tf.squeeze(norm_dist.sample(1), axis=0)
+                self.action_tf_var = tf.clip_by_value(self.action_tf_var, env_action_space_low, env_action_space_high)
+                self.action_prob = norm_dist.prob(self.action_tf_var)
+                self.entropy = norm_dist.entropy()
+                # policy gradient
+                self.policy_loss= -tf.log(norm_dist.prob(self.action) + 1e-5) * self.advantage
+                #Clipped Surrogate Objective
+                # ratio = self.action_prob / (self.old_action_probs  + 1e-10)
+                # a = ratio * self.advantage
+                # b = tf.clip_by_value(ratio, 1.0 - decay_epsilon, 1.0 + decay_epsilon) * self.advantage
+                # self.policy_loss=-tf.reduce_mean(tf.minimum(a,b))
+            else:
+                self.action_probs = tf.layers.dense(encoded_state, self.a_size, activation=tf.nn.softmax,
+                                                   kernel_initializer=tf.contrib.layers.variance_scaling_initializer(0.01))
+
+                self.picked_action_prob=tf.reduce_sum(self.action_probs * tf.one_hot(self.action, self.a_size), axis=1)
+                self.picked_old_action_prob=tf.reduce_sum(self.old_action_probs * tf.one_hot(self.action, self.a_size),axis=1)
+                self.entropy=-tf.reduce_sum(self.action_probs * tf.log(self.action_probs + 1e-10))
+                self.mean_entropy = -tf.reduce_mean(self.action_probs * tf.log(self.action_probs + 1e-10))
+                #Policy gradient
+                #self.policy_loss =tf.reduce_mean( -tf.log(self.picked_action_prob+ 1e-10) * self.advantage)
+                #Clipped Surrogate Objective
+                ratio = self.picked_action_prob / (self.picked_old_action_prob  + 1e-10)
+                a = ratio * self.advantage
+                b = tf.clip_by_value(ratio, 1.0 - decay_epsilon, 1.0 + decay_epsilon) * self.advantage
+                self.policy_loss=-tf.reduce_mean(tf.minimum(a,b))
+
             # Summaries for Tensorboard
             self.policy_summaries = tf.summary.merge([
                 tf.summary.scalar("policy_loss", self.policy_loss),
@@ -142,7 +162,11 @@ class Model():
         if not self.set_graph:
             self.summary_writer.add_graph(sess.graph)
             self.set_graph=True
-        return sess.run(self.action_probs, { self.state: state })
+        if self.action_type == 'continuous':
+            action, action_prob  = sess.run([self.action_tf_var, self.action_prob], feed_dict={self.state: state})
+            return action, action_prob
+        else:
+            return sess.run(self.action_probs, { self.state: state })
     
     def ValueEstimator(self,encoded_state):
         with tf.variable_scope("value_estimator"):
@@ -230,11 +254,11 @@ class Model():
                 self.summary_writer.add_summary(summaries5, global_step)
                  
 class Agent(object):
-    def __init__(self, sess, obs_type, env_name, total_episodes, discount_factor=0.99):
+    def __init__(self, sess, obs_type, action_type, env_name, total_episodes, discount_factor=0.99):
         self.env = gym.envs.make(env_name)
         self.render = False
         self.sess=sess
-        self.model= Model(summaries_dir='./experiments_ppo_'+env_name+'/summaries', obs_type=obs_type)
+        self.model= Model(summaries_dir='./experiments_ppo_'+env_name+'/summaries', obs_type=obs_type, action_type=action_type)
         #first build the model, then initialize variables
         self.sess.run(tf.global_variables_initializer())
         self.total_episodes = total_episodes
@@ -246,6 +270,7 @@ class Agent(object):
         self.lambda_ = 0.95
         self.env_name = env_name
         self.obs_type = obs_type
+        self.action_type = action_type
         self.checkpoint_dir = os.path.join('./experiments_ppo_'+env_name, 'checkpoints')
         self.checkpoint_path = os.path.join(self.checkpoint_dir, 'model')
         if not os.path.exists(self.checkpoint_dir):
@@ -291,8 +316,11 @@ class Agent(object):
             reward_sum, timesteps = 0, 0
             ii = 0
             while ii < 1000:
-                action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
-                action = np.random.choice(np.arange(len(action_prob)), p=action_prob)
+                if self.action_type == 'continuous':
+                    action, action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))
+                else:
+                    action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
+                    action = np.random.choice(np.arange(len(action_prob)), p=action_prob)
                 next_state, reward, done, info = self.env.step(action)
                 if self.obs_type == 'visual':
                     next_state = cv2.cvtColor(next_state, cv2.COLOR_BGR2GRAY)
@@ -415,8 +443,11 @@ class Agent(object):
         self.env.render()
         done=False
         while not done:
-            action_probs = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
-            action = np.random.choice(np.arange(len(action_probs)), p=action_probs)
+            if self.action_type == 'continuous':
+                    action, action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))
+                else:
+                    action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
+                    action = np.random.choice(np.arange(len(action_prob)), p=action_prob)
             next_state, reward, done, info = env_test.step(action)
             if self.obs_type == 'visual':
                 next_state = cv2.cvtColor(next_state, cv2.COLOR_BGR2GRAY)
