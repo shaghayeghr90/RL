@@ -1,4 +1,5 @@
 import os
+import argparse
 import gym
 import itertools
 import matplotlib
@@ -12,17 +13,20 @@ import cv2
 #Some parts of the code are inspired by Unity mlagents
 
 class Model():
-    def __init__(self,summaries_dir, obs_type, action_type, policy_type):
+    def __init__(self,summaries_dir, obs_type, action_type, policy_type, action_size, state_size):
         if summaries_dir:
             if not os.path.exists(summaries_dir):
                 os.makedirs(summaries_dir)
             self.summary_writer = tf.summary.FileWriter(summaries_dir)
 
         self.max_steps = 5e+5
-        self.a_size = env.action_space.n
-        self.state_size = env.observation_space.low.shape[0]
+        self.a_size = action_size
+        self.state_size = state_size
         self.visual_observations = 4
-        self.action = tf.placeholder(shape=[None],dtype=tf.int32, name="action")
+        if action_type == 'continuous':
+            self.action = tf.placeholder(shape=[None],dtype=tf.float32, name="action")
+        else:
+            self.action = tf.placeholder(shape=[None], dtype=tf.int32, name="action")
         self.obs_type = obs_type
         self.action_type= action_type
         self.policy_type = policy_type
@@ -86,7 +90,7 @@ class Model():
     def PolicyEstimator(self,encoded_state):
         with tf.variable_scope("policy_estimator"):
             self.decay_epsilon = tf.train.polynomial_decay(0.2, tf.train.get_global_step(), self.max_steps, 0.1, power=1.0)
-            self.advantage = tf.placeholder(shape=[None],dtype=tf.float32, name="advantage")
+            self.advantage = tf.placeholder(shape=[None], dtype=tf.float32, name="advantage")
             self.old_action_probs = tf.placeholder(shape=[None, self.a_size],dtype=tf.float32)
             if self.action_type == 'continuous':
                 mu = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
@@ -139,12 +143,12 @@ class Model():
             action, action_prob  = sess.run([self.action_tf_var, self.action_prob], feed_dict={self.state: state})
             return action, action_prob
         else:
-            return sess.run(self.action_probs, { self.state: state })
+            return sess.run(self.action_probs, {self.state: state})
     
     def ValueEstimator(self,encoded_state):
         with tf.variable_scope("value_estimator"):
             self.target = tf.placeholder(shape=[None], dtype=tf.float32, name="target")
-            self.old_values = tf.placeholder(shape=[None], dtype=tf.float32, name="target")
+            self.old_value = tf.placeholder(shape=[None], dtype=tf.float32, name="target")
             # self.value_estimate = tf.layers.dense(encoded_state,self.a_size,activation=None)
             # value_selected_action=tf.reduce_sum(self.value_estimate*tf.one_hot(self.action,self.a_size),axis=1)
             # self.value_loss = tf.reduce_mean(tf.squared_difference(self.value_selected_action, self.target))
@@ -157,7 +161,8 @@ class Model():
                 clipped_value_estimate = self.old_value + tf.clip_by_value(self.value_estimate - self.old_value , 
                                                                            -self.decay_epsilon, self.decay_epsilon)
                 b = tf.squared_difference(clipped_value_estimate, self.target)
-                self.value_loss = tf.reduce_mean(tf.minimum(a,b))
+                self.value_loss = tf.reduce_mean(tf.minimum(a,b))              
+                
 
             # Summaries for Tensorboard
             self.value_summaries = tf.summary.merge([
@@ -198,7 +203,7 @@ class Model():
     def define_loss(self,learning_rate=1e-3):
         decay_learning_rate= tf.train.polynomial_decay(learning_rate, tf.train.get_global_step(), self.max_steps, 1e-10, power=1.0)
         decay_beta = tf.train.polynomial_decay(5e-4, tf.train.get_global_step(), self.max_steps, 1e-5, power=1.0)
-        if obs_type == 'visual':
+        if self.obs_type == 'visual':
             self.loss = self.policy_loss + 0.5 * self.value_loss - decay_beta * tf.reduce_mean(self.entropy)+\
                 2.0 * self.fw_loss + 0.8 * self.q_loss
         else:
@@ -210,11 +215,11 @@ class Model():
             tf.summary.scalar("beta", decay_beta)
             ])
         
-    def update_model(self,sess,state,next_state,action,old_action_probs,target,advantage):
-        feed_dict = { self.state: state, self.next_state: next_state, 
-                     self.action: action, self.old_action_probs:old_action_probs, 
-                     self.target: target, self.advantage:advantage}
-        if obs_type == 'visual':
+    def update_model(self, sess, state, next_state, action, old_action_probs, target, advantage, old_value):
+        feed_dict = {self.state: state, self.next_state: next_state, 
+                     self.action: action, self.old_action_probs: old_action_probs, 
+                     self.target: target, self.advantage: advantage, self.old_value: old_value}
+        if self.obs_type == 'visual':
             summaries1, summaries2, summaries3, summaries4, summaries5, global_step, _, loss = \
             sess.run([self.lr_summaries, self.policy_summaries, 
                       self.value_summaries, self.inverse_dynamic_summaries, 
@@ -224,7 +229,7 @@ class Model():
             summaries1, summaries2, summaries3, global_step, _, loss = sess.run([self.lr_summaries, 
                                                                                  self.policy_summaries, 
                                                                                  self.value_summaries,                                                                                                                      tf.train.get_global_step(), 
-                                                                                 self.train_op, self.loss],feed_dict)
+                                                                                 self.train_op, self.loss], feed_dict)
         if self.summary_writer:
             self.summary_writer.add_summary(summaries1, global_step)
             self.summary_writer.add_summary(summaries2, global_step)
@@ -236,10 +241,16 @@ class Model():
 class Agent(object):
     def __init__(self, sess, obs_type, action_type, policy_type, env_name, total_episodes, discount_factor=0.99):
         self.env = gym.envs.make(env_name)
+        if obs_type != 'visual':
+            state_size = self.env.observation_space.low.shape[0]
+        else:
+            state_size = 84 * 84 * 4
+        action_size = self.env.action_space.n
         self.render = False
         self.sess=sess
         self.model= Model(summaries_dir='./experiments_ppo_'+env_name+'/summaries', 
-                          obs_type=obs_type, action_type=action_type, policy_type=policy_type)
+                          obs_type=obs_type, action_type=action_type, policy_type=policy_type,
+                         action_size=action_size, state_size=state_size)
         #first build the model, then initialize variables
         self.sess.run(tf.global_variables_initializer())
         self.total_episodes = total_episodes
@@ -268,7 +279,8 @@ class Agent(object):
     
     def train(self):
         total_t = self.sess.run(tf.train.get_global_step())
-        Transition = collections.namedtuple("Transition", ["state", "action","action_probs", "reward","td_target","td_error", "next_state", "done"])
+        Transition = collections.namedtuple("Transition", ["state", "action", "action_probs", "reward",
+                                                           "td_target", "td_error", "value_states", "next_state", "done"])
         replay_memory = []
         targets = []
         advantages = []
@@ -336,7 +348,7 @@ class Agent(object):
             rewards = np.array(rewards)
             dones = np.array(dones)
             if dones[-1] == True:
-                value_next = [[0.0]]
+                value_next = [0.0]
             else: 
                 value_next = self.model.value_predict(self.sess, np.expand_dims(next_states[-1], axis=0))
                 print('value_next: ', value_next.shape)
@@ -344,7 +356,7 @@ class Agent(object):
             value_states = np.concatenate((value_states, value_next), axis=0).ravel()
            
             discounted_rewards = [0] * len(rewards)
-            running_reward = value_next[0][0]
+            running_reward = value_next[0]
             for t in reversed(range(0, len(rewards))):
                 running_reward = rewards[t] +  self.discount_factor * running_reward
                 discounted_rewards[t] =  running_reward
@@ -360,7 +372,8 @@ class Agent(object):
             for i in range(len(states)): 
                 replay_memory.append(Transition(state=states[i], action=actions[i], 
                                                 action_probs=action_probs[i], reward=rewards[i],
-                                                td_target=discounted_rewards[i], td_error=gae[i], 
+                                                td_target=discounted_rewards[i], td_error=gae[i],
+                                                value_states=value_states[i],
                                                 next_state=next_states[i], done=dones[i]))
             total_t += 1
             
@@ -396,13 +409,13 @@ class Agent(object):
                     while start + self.batch_size < len(replay_memory):
                         samples = replay_memory[start: start + self.batch_size]
                         start = start + self.batch_size
-                        states_batch, action_batch, action_probs_batch, reward_batch, td_target_batch , td_error_batch , next_states_batch, done_batch = map(np.array, zip(*samples))
-                         if self.policy_type != 'ppo':
+                        states_batch, action_batch, action_probs_batch, reward_batch, td_target_batch , td_error_batch , old_value_batch, next_states_batch, done_batch = map(np.array, zip(*samples))
+                        if self.policy_type != 'ppo':
                             td_target_batch = (td_target_batch - mean_td_target) / (std_td_target + 1e-12)
                             td_error_batch = (td_error_batch-mean_td_error) / (std_td_error + 1e-12)
                         self.model.update_model(self.sess, states_batch, next_states_batch,
                                                 action_batch, action_probs_batch,
-                                                td_target_batch, td_error_batch)
+                                                td_target_batch, td_error_batch, old_value_batch)
                 replay_memory=[]
                 if num_updates % 100 == 0:
                     self.test(num_updates)
@@ -436,7 +449,7 @@ class Agent(object):
     def test(self, id_):
         # import time
         env_test = gym.envs.make(self.env_name)
-        env_test = gym.wrappers.Monitor(env_test, './experiments_ppo_'+env_name+'/recording'+str(id_)+'/')
+        env_test = gym.wrappers.Monitor(env_test, './experiments_ppo_' + self.env_name + '/recording' + str(id_) + '/')
         state = env_test.reset()
         if self.obs_type == 'visual':
             state = cv2.cvtColor(state, cv2.COLOR_BGR2GRAY)
@@ -446,14 +459,13 @@ class Agent(object):
             state = normalize_state(state)
         #fire
         # state, _, _, _ = self.env.step(1)
-        self.env.render()
         done=False
         while not done:
             if self.action_type == 'continuous':
-                    action, action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))
-                else:
-                    action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
-                    action = np.random.choice(np.arange(len(action_prob)), p=action_prob)
+                action, _ = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))
+            else:
+                action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
+                action = np.random.choice(np.arange(len(action_prob)), p=action_prob)
             next_state, reward, done, info = env_test.step(action)
             if self.obs_type == 'visual':
                 next_state = cv2.cvtColor(next_state, cv2.COLOR_BGR2GRAY)
@@ -464,28 +476,47 @@ class Agent(object):
             # time.sleep(1)
             state = next_state
         env_test.close()
+        
+        
+def arg_parser():
+    return argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-env_name = 'Breakout-v0'  # 'CartPole-v0'
-obs_type = 'visual'  # 'non_visual'
-policy_type = 'ppo' #'policy_gradient'
-env = gym.envs.make(env_name)
-state_space_samples = np.array([env.observation_space.sample() for x in range(10000)])
-# mean_states=np.mean(state_space_samples, axis=0)
-# std_states=np.std(state_space_samples, axis=0)
-# print(mean_states,std_states)
-def normalize_state(state):
-    # return (state-mean_states)/(std_states + 1e-12)
-    return state
-VALID_ACTIONS = np.arange(env.action_space.n).tolist()
-tf.reset_default_graph()
-global_step_tensor  = tf.Variable(0, name="global_step", trainable=False)
 
-train=True
-with tf.Session() as sess:
-    sess.run(global_step_tensor.initializer)
-    if train:
-        agent=Agent(sess, obs_type=obs_type, policy_type=policy_type, env_name=env_name, total_episodes=500000)
-        agent.train()
-    else:
-        agent=Agent(sess, obs_type=obs_type, policy_type=policy_type, env_name=env_name, total_episodes=5)
-        agent.test(0)
+def main():
+    parser = arg_parser()
+    parser.add_argument('--env_name', type=str, default='CartPole-v0', 
+                        choices=['CartPole-v0', 'Breakout-v0', 'MountainCarContinuous-v0'])
+    parser.add_argument('--obs_type', type=str, default='non_visual', choices=['non_visual', 'visual'])
+    parser.add_argument('--action_type', type=str, default='discrete', choices=['discrete', 'continuous'])
+    parser.add_argument('--policy_type', type=str, default='ppo', choices=['policy_gradient', 'ppo'])
+    parser.add_argument('--total_episodes', type=int, default='500000')
+    parser.add_argument('--train', type=bool, default=True)
+    args = parser.parse_args()
+    
+    env = gym.envs.make(args.env_name)
+    state_space_samples = np.array([env.observation_space.sample() for x in range(10000)])
+    # mean_states=np.mean(state_space_samples, axis=0)
+    # std_states=np.std(state_space_samples, axis=0)
+    # print(mean_states,std_states)
+    def normalize_state(state):
+        # return (state-mean_states)/(std_states + 1e-12)
+        return state
+    
+    tf.reset_default_graph()
+    global_step_tensor  = tf.Variable(0, name="global_step", trainable=False)
+
+    train=args.train
+    with tf.Session() as sess:
+        sess.run(global_step_tensor.initializer)
+        if train:
+            agent=Agent(sess, obs_type=args.obs_type, action_type=args.action_type, policy_type=args.policy_type, 
+                        env_name=args.env_name, total_episodes=500000)
+            agent.train()
+        else:
+            agent=Agent(sess, obs_type=args.obs_type, action_type=args.action_type, policy_type=args.policy_type, 
+                        env_name=args.env_name, total_episodes=5)
+            agent.test(0)
+
+            
+if __name__ == '__main__':
+    main()
