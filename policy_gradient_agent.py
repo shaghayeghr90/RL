@@ -13,7 +13,7 @@ import cv2
 #Some parts of the code are inspired by Unity mlagents
 
 class Model():
-    def __init__(self, summaries_dir, obs_type, action_type, policy_type, action_size, state_size):
+    def __init__(self, summaries_dir, obs_type, action_type, policy_type, action_size, state_size, action_low, action_high):
         if summaries_dir:
             if not os.path.exists(summaries_dir):
                 os.makedirs(summaries_dir)
@@ -24,16 +24,18 @@ class Model():
         self.state_size = state_size
         self.visual_observations = 4
         if action_type == 'continuous':
-            self.action = tf.placeholder(shape=[None],dtype=tf.float32, name="action")
+            self.action = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32, name="action")
+            self.action_low = action_low
+            self.action_high = action_high
         else:
             self.action = tf.placeholder(shape=[None], dtype=tf.int32, name="action")
         self.obs_type = obs_type
         self.action_type= action_type
         self.policy_type = policy_type
         if obs_type == 'visual': 
-            encoded_state, encoded_next_state=self.VisualStateProcessor()
+            encoded_state, encoded_next_state = self.VisualStateProcessor()
         else:
-            encoded_state, encoded_next_state=self.NonVisualStateProcessor()
+            encoded_state, encoded_next_state = self.NonVisualStateProcessor()
         self.PolicyEstimator(encoded_state)
         self.ValueEstimator(encoded_state)
         if obs_type == 'visual':
@@ -91,18 +93,26 @@ class Model():
         with tf.variable_scope("policy_estimator"):
             self.decay_epsilon = tf.train.polynomial_decay(0.2, tf.train.get_global_step(), self.max_steps, 0.1, power=1.0)
             self.advantage = tf.placeholder(shape=[None], dtype=tf.float32, name="advantage")
-            self.old_action_probs = tf.placeholder(shape=[None, self.a_size],dtype=tf.float32)
+            if self.action_type == 'continuous':
+                self.old_action_probs = tf.placeholder(shape=[None], dtype=tf.float32)
+            else:
+                self.old_action_probs = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32)
+                
             if self.action_type == 'continuous':
                 mu = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
                 sigma = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
                 sigma = tf.nn.softplus(sigma) + 1e-5
-                norm_dist = tf.contrib.distributions.Normal(mu, sigma)
+                if self.a_size == 1:
+                    norm_dist = tf.contrib.distributions.Normal(mu, sigma)
+                else:
+                    norm_dist =  tf.contrib.distributions.MultivariateNormalDiag(mu, sigma)
 
                 #action_tf_var can be backpropagated
                 self.action_tf_var = tf.squeeze(norm_dist.sample(1), axis=0)
-                self.action_tf_var = tf.clip_by_value(self.action_tf_var, env_action_space_low, env_action_space_high)
+                self.action_tf_var = tf.clip_by_value(self.action_tf_var, self.action_low, self.action_high)
                 self.action_prob = norm_dist.prob(self.action_tf_var)
                 self.entropy = norm_dist.entropy()
+                self.mean_entropy = tf.reduce_mean(self.entropy)
                 if self.policy_type == 'policy_gradient':
                     self.policy_loss= -tf.log(norm_dist.prob(self.action) + 1e-5) * self.advantage
                 elif self.policy_type == 'ppo':
@@ -175,11 +185,16 @@ class Model():
     def InverseDynamicEstimator(self, encoded_state, encoded_next_state):
         with tf.variable_scope("inverse_dynamic_estimator"):
             merge1 = tf.concat([encoded_state, encoded_next_state], axis=1)
-            q_fc1 = tf.layers.dense(merge1, units=256, activation=tf.nn.relu, name='q_fc1')
-            p1 = tf.layers.dense(q_fc1, units=self.a_size, activation=tf.nn.softmax, name='q_prob1')
-            self.picked_action_prob1 = tf.reduce_sum(p1 * tf.one_hot(self.action, self.a_size), axis=1)
-            self.q_losses = -tf.reduce_sum(tf.log(p1 + 1e-10) * tf.one_hot(self.action, self.a_size), axis=1)
-            self.q_loss=tf.reduce_mean(self.q_losses)
+            q_fc1 = tf.layers.dense(merge1, units=256, activation=tf.nn.relu, name='q_fc1')    
+            if self.action_type == 'continuous':
+                predicted_action = tf.layers.dense(q_fc1, self.a_size, activation=None)
+                self.q_losses = tf.reduce_sum(tf.squared_difference(predicted_action, self.action), axis=1)
+                self.q_loss = tf.reduce_mean(self.q_losses)
+            else:
+                p1 = tf.layers.dense(q_fc1, units=self.a_size, activation=tf.nn.softmax, name='q_prob1')
+                self.picked_action_prob1 = tf.reduce_sum(p1 * tf.one_hot(self.action, self.a_size), axis=1)
+                self.q_losses = -tf.reduce_sum(tf.log(p1 + 1e-10) * tf.one_hot(self.action, self.a_size), axis=1)
+                self.q_loss = tf.reduce_mean(self.q_losses)
 
             # Summaries for Tensorboard
             self.inverse_dynamic_summaries = tf.summary.merge([
@@ -190,7 +205,10 @@ class Model():
             
     def ForwardDynamicEstimator(self, encoded_state, encoded_next_state):
         with tf.variable_scope("forward_dynamic_estimator"):
-            merge1 = tf.concat([encoded_state, tf.one_hot(self.action,self.a_size)], axis=1)
+            if self.action_type == 'continuous':
+                merge1 = tf.concat([encoded_state, self.action], axis=1)
+            else:
+                merge1 = tf.concat([encoded_state, tf.one_hot(self.action,self.a_size)], axis=1)
             q_fc1 = tf.layers.dense(merge1, units=256, activation=tf.nn.relu, name='fw_fc1')
             predicted_encoded_next_state = tf.layers.dense(q_fc1, units=128, activation=tf.nn.relu, name='fw_fc2')
             self.fw_loss = tf.reduce_mean(tf.squared_difference(predicted_encoded_next_state, encoded_next_state))
@@ -200,12 +218,12 @@ class Model():
                 tf.summary.scalar("fw_loss", self.fw_loss)
                 ])
             
-    def define_loss(self, learning_rate=1e-3):
+    def define_loss(self, learning_rate=1e-4):
         decay_learning_rate = tf.train.polynomial_decay(learning_rate, tf.train.get_global_step(), self.max_steps, 1e-10, power=1.0)
         decay_beta = tf.train.polynomial_decay(5e-4, tf.train.get_global_step(), self.max_steps, 1e-5, power=1.0)
         if self.obs_type == 'visual':
             self.loss = self.policy_loss + 0.5 * self.value_loss - decay_beta * tf.reduce_mean(self.entropy) + \
-                2.0 * self.fw_loss + 0.8 * self.q_loss
+                2.0 * self.fw_loss + 8.0 * self.q_loss
         else:
             self.loss = self.policy_loss + 0.5 * self.value_loss - decay_beta * tf.reduce_mean(self.entropy)
         optimizer = tf.train.AdamOptimizer(learning_rate=decay_learning_rate)
@@ -246,12 +264,19 @@ class Agent(object):
             state_size = self.env.observation_space.low.shape[0]
         else:
             state_size = 84 * 84 * 4
-        action_size = self.env.action_space.n
+        if action_type == 'continuous':
+            action_size = self.env.action_space.low.shape[0]
+            action_low = self.env.action_space.low
+            action_high = self.env.action_space.high
+        else:
+            action_size = self.env.action_space.n
+            action_low = None
+            action_high = None
         self.render = False
         self.sess = sess
         self.model = Model(summaries_dir='./experiments_' + policy_type + '_' + env_name + '/summaries', 
                            obs_type=obs_type, action_type=action_type, policy_type=policy_type,
-                           action_size=action_size, state_size=state_size)
+                           action_size=action_size, state_size=state_size, action_low=action_low, action_high=action_high)
         #first build the model, then initialize variables
         self.sess.run(tf.global_variables_initializer())
         self.total_episodes = total_episodes
@@ -313,15 +338,20 @@ class Agent(object):
             # state, _, _, _ = self.env.step(1)
             if self.render:
                 self.env.render()
-            reward_sum, timesteps = 0, 0
+            reward_sum, episode_length = 0, 0
             ii = 0
             while ii < 1000:
                 if self.action_type == 'continuous':
                     action, action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))
+                    action = action[0]
+                    action_prob = action_prob[0]
                 else:
                     action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
                     action = np.random.choice(np.arange(len(action_prob)), p=action_prob)
                 next_state, reward, done, info = self.env.step(action)
+                reward_sum = reward_sum + reward
+                episode_length = episode_length + 1
+                done = False if episode_length == self.env._max_episode_steps else done
                 if self.obs_type == 'visual':
                     next_state = cv2.cvtColor(next_state, cv2.COLOR_BGR2GRAY)
                     next_state = cv2.resize(next_state, (84, 84))
@@ -338,8 +368,7 @@ class Agent(object):
                 next_states.append(next_state)
                 dones.append(done)
                 
-                reward_sum = reward_sum + reward
-                timesteps = timesteps + 1
+                
                 if done:
                     break
                 state = next_state
@@ -419,11 +448,11 @@ class Agent(object):
                 if num_updates % 100 == 0:
                     self.test(num_updates, use_new_env=True)
                 num_updates = num_updates + 1
-            # print("Episode {} finished. Total reward: {:.3g} ({} timesteps)"
-                  # .format(episode_number, reward_sum, timesteps))
+            # print("Episode {} finished. Total reward: {:.3g} ({} episode_length)"
+                  # .format(episode_number, reward_sum, episode_length))
             summary = tf.Summary()
             reward_history.append(reward_sum)
-            timestep_history.append(timesteps)
+            timestep_history.append(episode_length)
             if episode_number > 100:
                 avg = np.mean(reward_history[-100:])
                 avg_timesteps = np.mean(timestep_history[-100:])
@@ -432,7 +461,7 @@ class Agent(object):
                 avg_timesteps = np.mean(timestep_history)
             average_reward_history.append(avg)
             summary.value.add(tag="episode_reward", simple_value=reward_sum),
-            summary.value.add(tag="episode_length", simple_value=timesteps),
+            summary.value.add(tag="episode_length", simple_value=episode_length),
             summary.value.add(tag="100-episode average of rewards", simple_value=avg)
             summary.value.add(tag="100-episode average of timesteps", simple_value=avg_timesteps)
             self.model.summary_writer.add_summary(summary, total_t)
@@ -467,7 +496,9 @@ class Agent(object):
         done=False
         while not done:
             if self.action_type == 'continuous':
-                action, _ = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))
+                action, action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))
+                action = action[0]
+                action_prob = action_prob[0]
             else:
                 action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
                 action = np.random.choice(np.arange(len(action_prob)), p=action_prob)
@@ -495,7 +526,7 @@ def arg_parser():
 def main():
     parser = arg_parser()
     parser.add_argument('--env_name', type=str, default='CartPole-v0', 
-                        choices=['CartPole-v0', 'Breakout-v0', 'MountainCarContinuous-v0'])
+                        choices=['CartPole-v0', 'Breakout-v0', 'MountainCarContinuous-v0','LunarLanderContinuous-v2','CarRacing-v0'])
     parser.add_argument('--obs_type', type=str, default='non_visual', choices=['non_visual', 'visual'])
     parser.add_argument('--action_type', type=str, default='discrete', choices=['discrete', 'continuous'])
     parser.add_argument('--policy_type', type=str, default='ppo', choices=['policy_gradient', 'ppo'])
