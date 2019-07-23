@@ -22,7 +22,7 @@ class Model():
         self.max_steps = 5e+5
         self.a_size = action_size
         self.state_size = state_size
-        self.visual_observations = 4
+        self.use_swish_activation = True
         if action_type == 'continuous':
             self.action = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32, name="action")
             self.action_low = action_low
@@ -43,7 +43,15 @@ class Model():
             self.InverseDynamicEstimator(encoded_state, encoded_next_state)
         self.define_loss()
         self.set_graph=False
-        
+        if self.use_swish_activation:
+            self.activation = self.swish
+        else:
+            self.activation = tf.nn.relu 
+            
+    @staticmethod
+    def swish(x):
+        return x * tf.nn.sigmoid(x)
+    
     @staticmethod
     def create_visual_input(name):
         state = tf.placeholder(shape=[None, 84, 84, 4], dtype=tf.uint8, name=name)
@@ -57,7 +65,7 @@ class Model():
             conv2 = tf.layers.conv2d(conv1, 32, kernel_size=[4, 4], strides=[2, 2],
                                      activation=tf.nn.elu, reuse=False, name="conv_2")
             hidden = tf.layers.flatten(conv2)
-            hidden = tf.layers.dense(hidden, 128, activation=tf.nn.relu, reuse=False, name="hidden_1", 
+            hidden = tf.layers.dense(hidden, 128, activation=self.activation, reuse=False, name="hidden_1", 
                                      kernel_initializer=tf.contrib.layers.variance_scaling_initializer(1.0))
             
             self.next_state = self.create_visual_input("next_state")
@@ -66,7 +74,7 @@ class Model():
             conv2_1 = tf.layers.conv2d(conv1_1, 32, kernel_size=[4, 4], strides=[2, 2],
                                        activation=tf.nn.elu, reuse=True, name="conv_2")
             hidden_1 = tf.layers.flatten(conv2_1)
-            hidden_1 = tf.layers.dense(hidden_1, 128, activation=tf.nn.relu, reuse=True, name="hidden_1",
+            hidden_1 = tf.layers.dense(hidden_1, 128, activation=self.activation, reuse=True, name="hidden_1",
                                        kernel_initializer=tf.contrib.layers.variance_scaling_initializer(1.0))
             
         return hidden, hidden_1
@@ -99,8 +107,8 @@ class Model():
                 self.old_action_probs = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32)
                 
             if self.action_type == 'continuous':
-                mu = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
-                sigma = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
+                mu = tf.layers.dense(encoded_state, self.a_size, activation=None, tf.contrib.layers.xavier_initializer())
+                sigma = tf.layers.dense(encoded_state, self.a_size, activation=None, tf.contrib.layers.xavier_initializer())
                 sigma = tf.nn.softplus(sigma) + 1e-5
                 if self.a_size == 1:
                     norm_dist = tf.contrib.distributions.Normal(mu, sigma)
@@ -185,7 +193,7 @@ class Model():
     def InverseDynamicEstimator(self, encoded_state, encoded_next_state):
         with tf.variable_scope("inverse_dynamic_estimator"):
             merge1 = tf.concat([encoded_state, encoded_next_state], axis=1)
-            q_fc1 = tf.layers.dense(merge1, units=256, activation=tf.nn.relu, name='q_fc1')    
+            q_fc1 = tf.layers.dense(merge1, units=256, activation=self.activation, name='q_fc1')    
             if self.action_type == 'continuous':
                 predicted_action = tf.layers.dense(q_fc1, self.a_size, activation=None)
                 self.q_losses = tf.reduce_sum(tf.squared_difference(predicted_action, self.action), axis=1)
@@ -209,8 +217,11 @@ class Model():
                 merge1 = tf.concat([encoded_state, self.action], axis=1)
             else:
                 merge1 = tf.concat([encoded_state, tf.one_hot(self.action,self.a_size)], axis=1)
-            q_fc1 = tf.layers.dense(merge1, units=256, activation=tf.nn.relu, name='fw_fc1')
-            predicted_encoded_next_state = tf.layers.dense(q_fc1, units=128, activation=tf.nn.relu, name='fw_fc2')
+            q_fc1 = tf.layers.dense(merge1, units=256, activation=self.activation, name='fw_fc1')
+            if self.use_swish_activation:
+                predicted_encoded_next_state = tf.layers.dense(q_fc1, units=128, activation=None, name='fw_fc2')
+            else:
+                predicted_encoded_next_state = tf.layers.dense(q_fc1, units=128, activation=self.activation, name='fw_fc2')
             self.fw_loss = tf.reduce_mean(tf.squared_difference(predicted_encoded_next_state, encoded_next_state))
             
             # Summaries for Tensorboard
