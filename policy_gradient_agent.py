@@ -133,12 +133,12 @@ class Model():
                 self.action_probs = tf.layers.dense(encoded_state, self.a_size, activation=tf.nn.softmax,
                                                     kernel_initializer=tf.contrib.layers.variance_scaling_initializer(0.01))
 
-                self.picked_action_prob=tf.reduce_sum(self.action_probs * tf.one_hot(self.action, self.a_size), axis=1)
-                self.picked_old_action_prob=tf.reduce_sum(self.old_action_probs * tf.one_hot(self.action, self.a_size),axis=1)
-                self.entropy=-tf.reduce_sum(self.action_probs * tf.log(self.action_probs + 1e-10))
-                self.mean_entropy = -tf.reduce_mean(self.action_probs * tf.log(self.action_probs + 1e-10))
+                self.picked_action_prob = tf.reduce_sum(self.action_probs * tf.one_hot(self.action, self.a_size), axis=1)
+                self.picked_old_action_prob = tf.reduce_sum(self.old_action_probs * tf.one_hot(self.action, self.a_size), axis=1)
+                self.entropy = -tf.reduce_sum(self.action_probs * tf.log(self.action_probs + 1e-10), axis=1)
+                self.mean_entropy = tf.reduce_mean(self.entropy)
                 if self.policy_type == 'policy_gradient':
-                    self.policy_loss =tf.reduce_mean(-tf.log(self.picked_action_prob + 1e-10) * self.advantage)
+                    self.policy_loss = tf.reduce_mean(-tf.log(self.picked_action_prob + 1e-10) * self.advantage)
                 elif self.policy_type == 'ppo':
                     #Clipped Surrogate Objective
                     ratio = self.picked_action_prob / (self.picked_old_action_prob  + 1e-10)
@@ -222,8 +222,8 @@ class Model():
                 predicted_encoded_next_state = tf.layers.dense(q_fc1, units=128, activation=None, name='fw_fc2')
             else:
                 predicted_encoded_next_state = tf.layers.dense(q_fc1, units=128, activation=self.activation, name='fw_fc2')
-            self.fw_loss = tf.reduce_mean(0.5 * tf.reduce_sum(tf.squared_difference(predicted_encoded_next_state, 
-                                                                                    encoded_next_state), axis=1))
+            self.fw_loss = tf.reduce_mean(tf.reduce_sum(tf.squared_difference(predicted_encoded_next_state, 
+                                                                              encoded_next_state), axis=1))
             
             # Summaries for Tensorboard
             self.forward_dynamic_summaries = tf.summary.merge([
