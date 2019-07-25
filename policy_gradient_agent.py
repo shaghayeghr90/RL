@@ -222,7 +222,8 @@ class Model():
                 predicted_encoded_next_state = tf.layers.dense(q_fc1, units=128, activation=None, name='fw_fc2')
             else:
                 predicted_encoded_next_state = tf.layers.dense(q_fc1, units=128, activation=self.activation, name='fw_fc2')
-            self.fw_loss = tf.reduce_mean(tf.squared_difference(predicted_encoded_next_state, encoded_next_state))
+            self.fw_loss = tf.reduce_mean(0.5 * tf.reduce_sum(tf.squared_difference(predicted_encoded_next_state, 
+                                                                                    encoded_next_state), axis=1))
             
             # Summaries for Tensorboard
             self.forward_dynamic_summaries = tf.summary.merge([
