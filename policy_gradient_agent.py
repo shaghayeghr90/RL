@@ -23,6 +23,10 @@ class Model():
         self.a_size = action_size
         self.state_size = state_size
         self.use_swish_activation = True
+        if self.use_swish_activation:
+            self.activation = self.swish
+        else:
+            self.activation = tf.nn.relu
         if action_type == 'continuous':
             self.action = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32, name="action")
             self.action_low = action_low
@@ -43,10 +47,6 @@ class Model():
             self.InverseDynamicEstimator(encoded_state, encoded_next_state)
         self.define_loss()
         self.set_graph=False
-        if self.use_swish_activation:
-            self.activation = self.swish
-        else:
-            self.activation = tf.nn.relu 
             
     @staticmethod
     def swish(x):
