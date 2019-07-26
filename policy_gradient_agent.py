@@ -31,6 +31,7 @@ class Model():
             self.action = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32, name="action")
             self.action_low = action_low
             self.action_high = action_high
+            self.use_multivariate_normal = True
         else:
             self.action = tf.placeholder(shape=[None], dtype=tf.int32, name="action")
         self.obs_type = obs_type
@@ -100,17 +101,22 @@ class Model():
     def PolicyEstimator(self, encoded_state):
         with tf.variable_scope("policy_estimator"):
             self.decay_epsilon = tf.train.polynomial_decay(0.2, tf.train.get_global_step(), self.max_steps, 0.1, power=1.0)
-            self.advantage = tf.placeholder(shape=[None], dtype=tf.float32, name="advantage")
             if self.action_type == 'continuous':
-                self.old_action_probs = tf.placeholder(shape=[None], dtype=tf.float32)
+                if self.a_size == 1 or self.use_multivariate_normal:
+                    self.advantage = tf.placeholder(shape=[None], dtype=tf.float32, name="advantage")
+                    self.old_action_probs = tf.placeholder(shape=[None, 1], dtype=tf.float32)
+                elif self.a_size > 1:
+                    self.advantage = tf.placeholder(shape=[None, 1], dtype=tf.float32, name="advantage")
+                    self.old_action_probs = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32)
             else:
+                self.advantage = tf.placeholder(shape=[None], dtype=tf.float32, name="advantage")
                 self.old_action_probs = tf.placeholder(shape=[None, self.a_size], dtype=tf.float32)
                 
             if self.action_type == 'continuous':
-                mu = tf.layers.dense(encoded_state, self.a_size, activation=None, tf.contrib.layers.xavier_initializer())
-                sigma = tf.layers.dense(encoded_state, self.a_size, activation=None, tf.contrib.layers.xavier_initializer())
-                sigma = tf.nn.softplus(sigma) + 1e-5
-                if self.a_size == 1:
+                mu = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
+                sigma = tf.layers.dense(encoded_state, self.a_size, None, tf.contrib.layers.xavier_initializer())
+                sigma = tf.nn.softplus(sigma) + 1e-10
+                if self.a_size == 1 or not self.use_multivariate_normal:
                     norm_dist = tf.contrib.distributions.Normal(mu, sigma)
                 else:
                     norm_dist =  tf.contrib.distributions.MultivariateNormalDiag(mu, sigma)
@@ -122,7 +128,8 @@ class Model():
                 self.entropy = norm_dist.entropy()
                 self.mean_entropy = tf.reduce_mean(self.entropy)
                 if self.policy_type == 'policy_gradient':
-                    self.policy_loss= -tf.log(norm_dist.prob(self.action) + 1e-5) * self.advantage
+                    self.policy_loss = -tf.log(norm_dist.prob(self.action) + 1e-10) * self.advantage
+                    self.policy_loss = np.reduce_mean(self.policy_loss)
                 elif self.policy_type == 'ppo':
                     #Clipped Surrogate Objective
                     ratio = self.action_prob / (self.old_action_probs  + 1e-10)
@@ -246,6 +253,8 @@ class Model():
             ])
         
     def update_model(self, sess, state, next_state, action, old_action_probs, target, advantage, old_value):
+        if self.action_type == "continuous" and self.a_size > 1 and not self.use_multivariate_normal:
+            advatnage = np.expand_dims(advatnage, axis=1)
         feed_dict = {self.state: state, self.next_state: next_state, 
                      self.action: action, self.old_action_probs: old_action_probs, 
                      self.target: target, self.advantage: advantage, self.old_value: old_value}
@@ -355,8 +364,8 @@ class Agent(object):
             while ii < 1000:
                 if self.action_type == 'continuous':
                     action, action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))
-                    action = action[0]
-                    action_prob = action_prob[0]
+                    action = action.ravel()
+                    action_prob = action_prob.ravel()
                 else:
                     action_prob = self.model.policy_predict(self.sess, np.expand_dims(state, axis=0))[0]
                     action = np.random.choice(np.arange(len(action_prob)), p=action_prob)
